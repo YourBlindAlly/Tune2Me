@@ -1,0 +1,107 @@
+name: Build unsigned iOS ipa
+
+# Produces an unsigned .ipa for sideloading via SideStore, which applies its
+# own free-Apple-ID signature at install time. EAS Build's own iOS device
+# signing requires a paid Apple Developer Program account; this workflow
+# sidesteps that entirely by turning the project into a plain Xcode project
+# (expo prebuild) and archiving it with code signing turned off, on GitHub's
+# macOS runners (free for public repos) since there's no local Mac.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+env:
+  CI: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    # macos-15's Xcode tops out at 26.3, which fails to compile
+    # expo-modules-jsi's Swift 6.3 syntax. macos-26 carries newer Xcodes.
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Select Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: "26.4"
+
+      - name: Install JS dependencies
+        run: npm ci
+
+      - name: Prebuild native iOS project
+        run: npx expo prebuild --platform ios --non-interactive
+
+      - name: Find workspace and scheme
+        id: find
+        run: |
+          workspace=$(find ios -maxdepth 1 -name "*.xcworkspace" | head -n1)
+          # Querying the WORKSPACE can list every CocoaPods sub-target's
+          # scheme too (including any native module), so taking schemes[0]
+          # there depends on alphabetical luck (a real bug hit in the
+          # sibling LyriCue project). Querying the main .xcodeproj directly
+          # (it lives right under ios/, unlike Pods' own project which is
+          # nested under ios/Pods/) only ever lists the real app's own
+          # scheme, regardless of naming/sorting.
+          project=$(find ios -maxdepth 1 -name "*.xcodeproj" | head -n1)
+          scheme=$(xcodebuild -list -project "$project" -json | \
+            node -e "const d=JSON.parse(require('fs').readFileSync(0,'utf8')); console.log(d.project.schemes[0]);")
+          echo "workspace=$workspace" >> "$GITHUB_OUTPUT"
+          echo "scheme=$scheme" >> "$GITHUB_OUTPUT"
+          echo "Found workspace: $workspace, scheme: $scheme"
+
+      - name: Archive (code signing disabled)
+        run: |
+          xcodebuild archive \
+            -workspace "${{ steps.find.outputs.workspace }}" \
+            -scheme "${{ steps.find.outputs.scheme }}" \
+            -configuration Release \
+            -destination "generic/platform=iOS" \
+            -archivePath build/Tune2Me.xcarchive \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: Package unsigned ipa
+        run: |
+          app_path=$(find build/Tune2Me.xcarchive/Products/Applications -maxdepth 1 -name "*.app" | head -n1)
+          mkdir -p Payload
+          cp -r "$app_path" Payload/
+          zip -r Tune2Me-unsigned.ipa Payload
+          echo "Built: $(ls -la Tune2Me-unsigned.ipa)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Tune2Me-unsigned-ipa
+          path: Tune2Me-unsigned.ipa
+          retention-days: 30
+
+      # Workflow artifacts (above) require a logged-in GitHub session to
+      # download, which is awkward from a phone's browser. A GitHub Release
+      # asset is a plain public URL that Safari can download directly, then
+      # hand to SideStore/SideInstaller via the share sheet — no computer, no
+      # GitHub login, needed. "latest-build" is a single rolling tag/release
+      # that gets replaced on every push, so this URL never changes and can
+      # be bookmarked once:
+      # https://github.com/<owner>/<repo>/releases/download/latest-build/Tune2Me-unsigned.ipa
+      - name: Publish to the rolling "latest-build" release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete latest-build --yes --repo "${{ github.repository }}" || true
+          git tag -f latest-build
+          git push -f origin latest-build
+          gh release create latest-build Tune2Me-unsigned.ipa \
+            --repo "${{ github.repository }}" \
+            --title "Latest unsigned build" \
+            --notes "Automatically published from commit ${{ github.sha }}. Unsigned — install via SideStore/SideInstaller, which applies its own free-Apple-ID signature." \
+            --latest
