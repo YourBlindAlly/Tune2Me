@@ -1,26 +1,15 @@
 import { StatusBar } from 'expo-status-bar';
-import { StyleSheet, Text, View } from 'react-native';
+import { SafeAreaProvider } from 'react-native-safe-area-context';
+import AudioEngineDebugScreen from './src/screens/AudioEngineDebugScreen';
 
+// Phase 1 of the build plan: prove the native audio engine works on real
+// hardware before any real app screens/navigation exist. This IS the app,
+// for now.
 export default function App() {
   return (
-    <View style={styles.container} accessible accessibilityLabel="Tune2Me scaffold build">
-      <Text style={styles.title}>Tune2Me</Text>
-      <Text>Pipeline scaffold — no tuner features yet.</Text>
+    <SafeAreaProvider>
+      <AudioEngineDebugScreen />
       <StatusBar style="auto" />
-    </View>
+    </SafeAreaProvider>
   );
 }
-
-const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-    backgroundColor: '#fff',
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  title: {
-    fontSize: 28,
-    fontWeight: '700',
-    marginBottom: 8,
-  },
-});
