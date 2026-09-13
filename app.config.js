@@ -28,8 +28,5 @@ module.exports = {
       },
       predictiveBackGestureEnabled: false,
     },
-    web: {
-      favicon: './assets/favicon.png',
-    },
   },
 };
