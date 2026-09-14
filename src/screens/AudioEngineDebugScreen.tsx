@@ -13,8 +13,9 @@ import { usePitchDetection } from '../../modules/tune2me-audio-engine/src/usePit
 // Not a real app screen — no styling polish intended, just accessible
 // enough to actually run the checks with VoiceOver.
 export default function AudioEngineDebugScreen() {
-  const { latestPitch, inputPortName, isListening, start, stop } = usePitchDetection();
+  const { latestPitch, inputPortName, isListening, lastError, start, stop } = usePitchDetection();
   const [toneFrequencyText, setToneFrequencyText] = useState('440');
+  const [toneError, setToneError] = useState<string | null>(null);
 
   // The pitch readout updates up to ~15 times a second. If this Text held
   // a content-tracking accessibilityLabel, VoiceOver would try to
@@ -31,6 +32,7 @@ export default function AudioEngineDebugScreen() {
     } else {
       parts.push('No pitch detected yet');
     }
+    if (lastError) parts.push(`Last error: ${lastError}`);
     Speech.speak(parts.join(', '), { useApplicationAudioSession: false });
   };
 
@@ -45,7 +47,12 @@ export default function AudioEngineDebugScreen() {
   const playTestTone = async (durationSeconds: number) => {
     const frequency = parseFloat(toneFrequencyText);
     if (!Number.isFinite(frequency) || frequency <= 0) return;
-    await Tune2MeAudioEngine.playTone(frequency, durationSeconds);
+    try {
+      await Tune2MeAudioEngine.playTone(frequency, durationSeconds);
+      setToneError(null);
+    } catch (error) {
+      setToneError(error instanceof Error ? error.message : String(error));
+    }
   };
 
   return (
@@ -63,6 +70,12 @@ export default function AudioEngineDebugScreen() {
             : 'No pitch detected yet'}
         </Text>
       </View>
+
+      {(lastError || toneError) && (
+        <Text style={styles.errorText} accessibilityLiveRegion="polite">
+          Error: {lastError ?? toneError}
+        </Text>
+      )}
 
       <Pressable
         onPress={handleToggleListening}
@@ -142,6 +155,11 @@ const styles = StyleSheet.create({
   readout: {
     fontSize: 16,
     fontVariant: ['tabular-nums'],
+  },
+  errorText: {
+    fontSize: 15,
+    color: '#b00020',
+    fontWeight: '600',
   },
   sectionLabel: {
     fontSize: 18,

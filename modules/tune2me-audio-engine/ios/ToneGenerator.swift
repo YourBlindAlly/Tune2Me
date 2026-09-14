@@ -43,6 +43,15 @@ final class ToneGenerator {
     private var sampleClock: Double = 0
     private let lock = NSLock()
 
+    /// Whether a tone is currently sounding — used by the module to decide
+    /// whether it's safe to tear down the engine/session (see
+    /// Tune2MeAudioEngineModule.teardownEngineIfIdle()).
+    var isActive: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return activeVoice != nil
+    }
+
     /// Starts playing `frequencyHz` for `durationSeconds`, replacing
     /// whatever tone (if any) is currently sounding.
     func play(frequencyHz: Double, durationSeconds: Double) {

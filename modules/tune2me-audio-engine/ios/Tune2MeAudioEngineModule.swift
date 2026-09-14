@@ -11,10 +11,19 @@ import AVFoundation
 // technical risk in the app and needs validation against real hardware
 // before any UI is built on top of it:
 //   1. Built-in mic override survives a Bluetooth/wired headphone connect.
-//   2. No VoiceOver volume ducking while listening (the ".measurement"
-//      mode, not voice-chat/default, is what's supposed to prevent this).
-//   3. Pitch accuracy against a known-good reference.
-//   4. Tone character + exact target frequency, by ear.
+//      CONFIRMED WORKING on-device 2026-09-14 (survived a wired headphone
+//      connect without falling back to the headphone mic).
+//   2. No VoiceOver volume ducking while listening. ".measurement" mode
+//      alone was NOT enough — confirmed on-device 2026-09-14 that VoiceOver
+//      still ducked dramatically and stayed ducked indefinitely. Root
+//      cause was missing ".mixWithOthers" plus the engine/session never
+//      being torn down; see configureSession()/teardownEngineIfIdle().
+//      Needs re-testing after that fix.
+//   3. Pitch accuracy against a known-good reference. Not yet reachable —
+//      blocked on the startListening() crash (also fixed 2026-09-14, see
+//      installTap's format: nil comment below); needs re-testing.
+//   4. Tone character + exact target frequency, by ear. CONFIRMED WORKING
+//      on-device 2026-09-14 (a tone played, audibly at the right pitch).
 // None of these are verifiable from CI — CI can only prove this compiles.
 public class Tune2MeAudioEngineModule: Module {
     private let engine = AVAudioEngine()
@@ -47,6 +56,7 @@ public class Tune2MeAudioEngineModule: Module {
 
         Function("stopListening") {
             self.stopListening()
+            self.teardownEngineIfIdle()
         }
 
         AsyncFunction("playTone") { (frequencyHz: Double, durationSeconds: Double) throws -> Void in
@@ -56,6 +66,7 @@ public class Tune2MeAudioEngineModule: Module {
 
         Function("stopTone") {
             self.toneGenerator.stop()
+            self.teardownEngineIfIdle()
         }
 
         Function("getCurrentInputPortName") { () -> String? in
@@ -74,13 +85,19 @@ public class Tune2MeAudioEngineModule: Module {
 
     private func configureSession() throws {
         let session = AVAudioSession.sharedInstance()
-        // .measurement mode (not .voiceChat/.default) is the core
-        // requirement here: those modes apply echo cancellation, noise
-        // suppression, and automatic gain control, which both distort
-        // pitch analysis AND are responsible for the known VoiceOver
-        // volume-ducking bug this app exists to avoid (named in the spec:
-        // "Talking Tuner").
-        try session.setCategory(.playAndRecord, mode: .measurement, options: [.allowBluetoothA2DP, .defaultToSpeaker])
+        // .measurement mode (not .voiceChat/.default) avoids the DSP-driven
+        // part of the VoiceOver-ducking problem (echo cancellation / AGC
+        // distorting both pitch analysis and other audio). But mode alone
+        // wasn't enough — confirmed on-device: without .mixWithOthers, an
+        // active .playAndRecord session tells iOS this app needs audio
+        // priority, and VoiceOver's own speech gets ducked as "other
+        // audio" exactly like the "Talking Tuner" bug this app exists to
+        // avoid. .mixWithOthers is what actually stops that.
+        try session.setCategory(
+            .playAndRecord,
+            mode: .measurement,
+            options: [.mixWithOthers, .allowBluetoothA2DP, .defaultToSpeaker]
+        )
         try session.setActive(true)
         try preferBuiltInMic(session: session)
     }
@@ -146,9 +163,16 @@ public class Tune2MeAudioEngineModule: Module {
         guard !isListening else { return }
         try ensureEngineRunning()
 
-        let inputFormat = engine.inputNode.inputFormat(forBus: 0)
-        engine.inputNode.installTap(onBus: 0, bufferSize: 2048, format: inputFormat) { [weak self] buffer, _ in
-            self?.processInputBuffer(buffer, sampleRate: inputFormat.sampleRate)
+        // format: nil (not a pre-computed format) is deliberate — it lets
+        // AVAudioEngine use the input bus's own current format. Passing an
+        // explicit format queried before the input route is fully settled
+        // can be an invalid/zero-channel format, which crashes installTap
+        // with a native exception Swift's try/catch cannot catch (this is
+        // what caused the app to silently die on Start Listening during
+        // Phase 1 on-device testing, 2026-09-14). The actual format is
+        // read from each buffer instead.
+        engine.inputNode.installTap(onBus: 0, bufferSize: 2048, format: nil) { [weak self] buffer, _ in
+            self?.processInputBuffer(buffer, sampleRate: buffer.format.sampleRate)
         }
         isListening = true
     }
@@ -157,6 +181,17 @@ public class Tune2MeAudioEngineModule: Module {
         guard isListening else { return }
         engine.inputNode.removeTap(onBus: 0)
         isListening = false
+    }
+
+    // Without this, the engine and session stay active indefinitely after
+    // the first playTone()/startListening() call — confirmed on-device:
+    // VoiceOver stayed ducked for the rest of the app's life, and "Stop
+    // Tone" did nothing, because stopping tone playback alone never
+    // deactivated the session that was actually causing the ducking.
+    private func teardownEngineIfIdle() {
+        guard !isListening, !toneGenerator.isActive, engine.isRunning else { return }
+        engine.stop()
+        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
     }
 
     // MARK: - Pitch detection
