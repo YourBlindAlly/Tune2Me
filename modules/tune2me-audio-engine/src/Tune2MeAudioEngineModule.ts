@@ -23,6 +23,9 @@ declare class Tune2MeAudioEngineModule extends NativeModule<Tune2MeAudioEngineEv
   playTone(frequencyHz: number, durationSeconds: number): Promise<void>;
   stopTone(): void;
   getCurrentInputPortName(): string | null;
+  /** Mode 3's "drone" experiment: plays frequencyHz continuously while listening, using voice processing (echo cancellation) to stay loud. */
+  startDroneListening(frequencyHz: number): Promise<void>;
+  stopDroneListening(): void;
 }
 
 export default requireNativeModule<Tune2MeAudioEngineModule>('Tune2MeAudioEngine');

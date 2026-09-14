@@ -52,12 +52,23 @@ final class ToneGenerator {
         return activeVoice != nil
     }
 
+    // A "sustained" tone (Mode 3's drone-style simultaneous play+listen)
+    // just uses a very long duration and relies on an explicit stop()
+    // rather than the envelope's own release — reuses the exact same
+    // render path as a short pluck instead of needing separate logic.
+    private static let sustainedDurationSeconds: Double = 3600
+
     /// Starts playing `frequencyHz` for `durationSeconds`, replacing
     /// whatever tone (if any) is currently sounding.
     func play(frequencyHz: Double, durationSeconds: Double) {
         lock.lock()
         activeVoice = Voice(frequencyHz: frequencyHz, startSample: sampleClock, durationSeconds: durationSeconds)
         lock.unlock()
+    }
+
+    /// Starts playing `frequencyHz` indefinitely, until `stop()` is called.
+    func playSustained(frequencyHz: Double) {
+        play(frequencyHz: frequencyHz, durationSeconds: Self.sustainedDurationSeconds)
     }
 
     func stop() {

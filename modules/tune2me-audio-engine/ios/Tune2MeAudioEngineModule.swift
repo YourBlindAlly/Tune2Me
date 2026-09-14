@@ -41,6 +41,8 @@ public class Tune2MeAudioEngineModule: Module {
     // ~15Hz is plenty for a tuning UI — no need to emit at audio rate.
     private let minEmitInterval: TimeInterval = 1.0 / 15.0
     private var routeObserver: NSObjectProtocol?
+    private var configChangeObserver: NSObjectProtocol?
+    private var isDroneModeActive = false
 
     public func definition() -> ModuleDefinition {
         Name("Tune2MeAudioEngine")
@@ -55,18 +57,34 @@ public class Tune2MeAudioEngineModule: Module {
             ) { [weak self] _ in
                 self?.handleRouteChange()
             }
+
+            // Enabling voice processing (drone mode) can make AVAudioEngine
+            // stop itself as a side effect of the internal graph changing —
+            // confirmed via research, not something preventable, only
+            // reactable-to. Without this observer, drone mode would go
+            // silent immediately after starting.
+            self.configChangeObserver = NotificationCenter.default.addObserver(
+                forName: .AVAudioEngineConfigurationChange,
+                object: self.engine,
+                queue: .main
+            ) { [weak self] _ in
+                self?.handleEngineConfigurationChange()
+            }
         }
 
         AsyncFunction("startListening") { () throws -> Void in
+            guard !self.isDroneModeActive else { return }
             try self.startListening()
         }
 
         Function("stopListening") {
+            guard !self.isDroneModeActive else { return }
             self.stopListening()
             self.teardownEngineIfIdle()
         }
 
         AsyncFunction("playTone") { (frequencyHz: Double, durationSeconds: Double) throws -> Void in
+            guard !self.isDroneModeActive else { return }
             // Only request recording capability if we're already listening
             // (Mode 3's simultaneous play+listen). A standalone tone (Mode
             // 1, mic never touched) uses .playback instead of
@@ -76,6 +94,7 @@ public class Tune2MeAudioEngineModule: Module {
         }
 
         Function("stopTone") {
+            guard !self.isDroneModeActive else { return }
             self.toneGenerator.stop()
             self.teardownEngineIfIdle()
         }
@@ -84,11 +103,34 @@ public class Tune2MeAudioEngineModule: Module {
             AVAudioSession.sharedInstance().currentRoute.inputs.first?.portName
         }
 
+        // Mode 3's "drone" experiment: play a reference tone continuously
+        // WHILE listening, rather than play-then-listen sequentially. This
+        // needs .voiceChat mode (not .measurement) plus Apple's Voice
+        // Processing I/O (the same mechanism a real phone call uses to
+        // stay loud while two-way) — .measurement mode is deliberately
+        // quiet for output by Apple's own design (see configureSession's
+        // comment), which is fine for Mode 2's listen-only case but not
+        // for playing a tone the user needs to actually hear. Genuinely
+        // unproven territory - needs real on-device testing for both
+        // volume AND whether echo cancellation distorts pitch detection
+        // of the user's actual note.
+        AsyncFunction("startDroneListening") { (frequencyHz: Double) throws -> Void in
+            try self.startDroneListening(frequencyHz: frequencyHz)
+        }
+
+        Function("stopDroneListening") {
+            self.stopDroneListening()
+        }
+
         OnDestroy {
             if let observer = self.routeObserver {
                 NotificationCenter.default.removeObserver(observer)
             }
+            if let observer = self.configChangeObserver {
+                NotificationCenter.default.removeObserver(observer)
+            }
             self.stopListening()
+            self.stopDroneListening()
         }
     }
 
@@ -219,6 +261,82 @@ public class Tune2MeAudioEngineModule: Module {
         guard isListening else { return }
         engine.inputNode.removeTap(onBus: 0)
         isListening = false
+    }
+
+    // MARK: - Drone mode (Mode 3, simultaneous play + listen)
+
+    private func startDroneListening(frequencyHz: Double) throws {
+        guard !isListening, !isDroneModeActive else { return }
+
+        // .voiceChat (not .measurement) keeps full output volume, matching
+        // how a real phone call stays loud while two-way — see
+        // configureSession()'s comment for why .measurement can't do this.
+        let session = AVAudioSession.sharedInstance()
+        try session.setCategory(
+            .playAndRecord,
+            mode: .voiceChat,
+            options: [.mixWithOthers, .allowBluetoothA2DP, .defaultToSpeaker]
+        )
+        try session.setActive(true)
+        try preferBuiltInMic(session: session)
+
+        if engine.isRunning { engine.stop() }
+        recordingCapable = false
+
+        // Order matters here (confirmed via research): the playback graph
+        // must exist BEFORE voice processing is enabled, or its echo
+        // cancellation has no reference for "what the speaker is playing"
+        // and never removes our own tone from the mic signal.
+        attachSourceNodeIfNeeded()
+        try engine.inputNode.setVoiceProcessingEnabled(true)
+        try engine.outputNode.setVoiceProcessingEnabled(true)
+
+        engine.prepare()
+        try engine.start()
+        recordingCapable = true
+
+        // format: nil for the same reason as startListening() — see that
+        // function's comment. Voice processing also changes the input
+        // buffer's channel count (reportedly 1 -> 5) - reading channel 0
+        // via floatChannelData[0] (in processInputBuffer) should still be
+        // the processed mono voice signal regardless, but this needs
+        // confirming on-device, not just assumed.
+        engine.inputNode.installTap(onBus: 0, bufferSize: 2048, format: nil) { [weak self] buffer, _ in
+            self?.processInputBuffer(buffer, sampleRate: buffer.format.sampleRate)
+        }
+
+        toneGenerator.playSustained(frequencyHz: frequencyHz)
+        isListening = true
+        isDroneModeActive = true
+    }
+
+    private func stopDroneListening() {
+        guard isDroneModeActive else { return }
+        toneGenerator.stop()
+        if isListening {
+            engine.inputNode.removeTap(onBus: 0)
+            isListening = false
+        }
+        if engine.inputNode.isVoiceProcessingEnabled {
+            try? engine.inputNode.setVoiceProcessingEnabled(false)
+        }
+        if engine.outputNode.isVoiceProcessingEnabled {
+            try? engine.outputNode.setVoiceProcessingEnabled(false)
+        }
+        isDroneModeActive = false
+        engine.stop()
+        recordingCapable = false
+        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+    }
+
+    private func handleEngineConfigurationChange() {
+        // Enabling voice processing (or other engine-graph changes) can
+        // stop the engine out from under us - confirmed via research as a
+        // known AVAudioEngine behavior, not preventable, only reactable
+        // to. Restart it if it's supposed to be running.
+        guard !engine.isRunning, isListening || toneGenerator.isActive else { return }
+        engine.prepare()
+        try? engine.start()
     }
 
     // Without this, the engine and session stay active indefinitely after

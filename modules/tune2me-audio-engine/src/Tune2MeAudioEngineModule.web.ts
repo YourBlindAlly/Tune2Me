@@ -20,6 +20,10 @@ const stub = {
   getCurrentInputPortName(): string | null {
     return null;
   },
+  async startDroneListening(_frequencyHz: number): Promise<void> {
+    console.warn('Tune2MeAudioEngine: drone listening is not available on web.');
+  },
+  stopDroneListening(): void {},
   addListener<EventName extends keyof Tune2MeAudioEngineEvents>(eventName: EventName, listener: Listener<EventName>) {
     if (!listeners.has(eventName)) listeners.set(eventName, new Set());
     listeners.get(eventName)!.add(listener as (event: unknown) => void);

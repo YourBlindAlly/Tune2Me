@@ -16,6 +16,8 @@ export default function AudioEngineDebugScreen() {
   const { latestPitch, inputPortName, isListening, lastError, start, stop } = usePitchDetection();
   const [toneFrequencyText, setToneFrequencyText] = useState('440');
   const [toneError, setToneError] = useState<string | null>(null);
+  const [isDroneActive, setIsDroneActive] = useState(false);
+  const [droneError, setDroneError] = useState<string | null>(null);
 
   // The pitch readout updates up to ~15 times a second. If this Text held
   // a content-tracking accessibilityLabel, VoiceOver would try to
@@ -55,6 +57,26 @@ export default function AudioEngineDebugScreen() {
     }
   };
 
+  // Mode 3's "drone" experiment — tone plays continuously WHILE listening,
+  // using voice processing (echo cancellation) to try to stay loud. See
+  // Tune2MeAudioEngineModule.swift's startDroneListening comment.
+  const toggleDrone = async () => {
+    if (isDroneActive) {
+      Tune2MeAudioEngine.stopDroneListening();
+      setIsDroneActive(false);
+      return;
+    }
+    const frequency = parseFloat(toneFrequencyText);
+    if (!Number.isFinite(frequency) || frequency <= 0) return;
+    try {
+      await Tune2MeAudioEngine.startDroneListening(frequency);
+      setIsDroneActive(true);
+      setDroneError(null);
+    } catch (error) {
+      setDroneError(error instanceof Error ? error.message : String(error));
+    }
+  };
+
   return (
     <View style={styles.container}>
       <Text style={styles.title}>Audio Engine Debug</Text>
@@ -71,9 +93,9 @@ export default function AudioEngineDebugScreen() {
         </Text>
       </View>
 
-      {(lastError || toneError) && (
+      {(lastError || toneError || droneError) && (
         <Text style={styles.errorText} accessibilityLiveRegion="polite">
-          Error: {lastError ?? toneError}
+          Error: {lastError ?? toneError ?? droneError}
         </Text>
       )}
 
@@ -134,6 +156,19 @@ export default function AudioEngineDebugScreen() {
         hitSlop={{ top: 14, bottom: 14, left: 14, right: 14 }}
       >
         <Text style={styles.buttonText}>Stop Tone</Text>
+      </Pressable>
+
+      <View style={styles.divider} />
+
+      <Text style={styles.sectionLabel}>Mode 3 Drone Test (simultaneous play + listen)</Text>
+      <Pressable
+        onPress={toggleDrone}
+        style={styles.button}
+        accessibilityRole="button"
+        accessibilityLabel={isDroneActive ? 'Stop drone' : 'Start drone'}
+        hitSlop={{ top: 14, bottom: 14, left: 14, right: 14 }}
+      >
+        <Text style={styles.buttonText}>{isDroneActive ? 'Stop Drone' : 'Start Drone (Simultaneous)'}</Text>
       </Pressable>
     </View>
   );
