@@ -32,9 +32,16 @@ export function usePitchDetection() {
     }
   }, []);
 
+  // Clearing inputPortName/latestPitch here matters — without it, the
+  // debug screen kept showing the last-known mic name and pitch reading
+  // after stopping, which read as "the app still thinks it's listening"
+  // (a real report from on-device testing 2026-09-14) even though it had
+  // actually stopped — this was a stale-UI bug, not an engine bug.
   const stop = useCallback(() => {
     Tune2MeAudioEngine.stopListening();
     setIsListening(false);
+    setInputPortName(null);
+    setLatestPitch(null);
   }, []);
 
   return { latestPitch, inputPortName, isListening, lastError, start, stop };

@@ -13,24 +13,26 @@ import AVFoundation
 //   1. Built-in mic override survives a Bluetooth/wired headphone connect.
 //      CONFIRMED WORKING on-device 2026-09-14 (survived a wired headphone
 //      connect without falling back to the headphone mic).
-//   2. No VoiceOver volume ducking while listening. Multiple rounds of
-//      on-device testing 2026-09-14 found: this is NOT ordinary ducking
-//      (one thing quiets while another plays), it's a uniform drop in ALL
-//      output; it happens on Start Listening ALONE, no tone needed, which
-//      is why .measurement mode itself (not just .playAndRecord) is the
-//      real culprit — see configureSession()'s comment; and real phone
-//      calls stay loud on speakerphone (Rusty's own sharp catch), which is
-//      what pointed at .voiceChat's Voice Processing I/O rather than a
-//      session-option fix. Currently testing TWO parallel approaches:
-//      .default mode for plain listening (Mode 2, no tone playing), and
-//      Voice Processing I/O + .voiceChat mode for "drone" mode (Mode 3,
-//      tone playing WHILE listening — see startDroneListening()). Neither
-//      confirmed working yet.
-//   3. Pitch accuracy against a known-good reference. Not yet reachable —
-//      blocked on TWO crashes now fixed: the original installTap format
-//      crash, and a second crash on a repeated Start Listening caused by
-//      reusing a stale cached output format across a stop/restart cycle
-//      (see reconnectSourceNodeToCurrentFormat()). Needs re-testing.
+//   2. No VoiceOver volume ducking while listening. CONFIRMED WORKING for
+//      plain listening (Mode 2) on-device 2026-09-14: switching from
+//      .measurement to .default mode fixed it, volume stayed normal with
+//      listening on. (Backstory: this was NOT ordinary ducking, it was a
+//      uniform drop in ALL output including our own tone, happened on
+//      Start Listening alone with no tone needed, and real phone calls
+//      stay loud on speakerphone — Rusty's own catch — which is what
+//      pointed at .measurement mode's deliberate quiet-output design as
+//      the real culprit, not .playAndRecord itself.) STILL UNPROVEN for
+//      Mode 3's drone mode (.voiceChat + Voice Processing I/O) — not yet
+//      tested.
+//   3. Pitch accuracy against a known-good reference. Still not reached —
+//      blocked on repeated crashes on a second Start Listening. Two
+//      causes fixed so far (a stale-format crash in installTap, then a
+//      stale-format crash in the output node's connection after a
+//      stop/restart), but crashed AGAIN after those fixes specifically
+//      because the toggle was still fully stopping/reconfiguring/
+//      restarting the whole engine on every use. Fixed 2026-09-14 by not
+//      doing that anymore — see startListening()'s comment. Needs
+//      re-testing.
 //   4. Tone character + exact target frequency, by ear. CONFIRMED WORKING
 //      on-device 2026-09-14 (a tone played, audibly at the right pitch).
 // None of these are verifiable from CI — CI can only prove this compiles.
@@ -82,7 +84,6 @@ public class Tune2MeAudioEngineModule: Module {
         Function("stopListening") {
             guard !self.isDroneModeActive else { return }
             self.stopListening()
-            self.teardownEngineIfIdle()
         }
 
         AsyncFunction("playTone") { (frequencyHz: Double, durationSeconds: Double) throws -> Void in
@@ -98,7 +99,6 @@ public class Tune2MeAudioEngineModule: Module {
         Function("stopTone") {
             guard !self.isDroneModeActive else { return }
             self.toneGenerator.stop()
-            self.teardownEngineIfIdle()
         }
 
         Function("getCurrentInputPortName") { () -> String? in
@@ -133,6 +133,7 @@ public class Tune2MeAudioEngineModule: Module {
             }
             self.stopListening()
             self.stopDroneListening()
+            self.teardownEngineIfIdle()
         }
     }
 
@@ -266,6 +267,24 @@ public class Tune2MeAudioEngineModule: Module {
         engine.connect(node, to: engine.mainMixerNode, format: format)
     }
 
+    // Toggling listening on/off just installs/removes the tap on an
+    // already-running engine — it deliberately does NOT stop/reconfigure
+    // the engine or session each time. That used to happen on every
+    // toggle (to recover VoiceOver's volume after .measurement mode), but
+    // now that plain listening uses .default mode (no ducking to recover
+    // from, see configureSession()), that stop/reconfigure/restart cycle
+    // was pure unnecessary risk — confirmed on-device 2026-09-14: it
+    // crashed on a second Start Listening even after the earlier format-
+    // staleness fix, and repeatedly tearing down and rebuilding the whole
+    // engine graph is a much riskier operation than just toggling a tap.
+    // The engine stays running (session active) between starts/stops now;
+    // teardownEngineIfIdle() only runs at OnDestroy as final cleanup.
+    // Known follow-up for later polish, not blocking Phase 1 testing: this
+    // means iOS's microphone privacy indicator likely stays lit after
+    // "Stop Listening" too, since the session itself stays active even
+    // with the tap removed — the real app should probably deactivate on
+    // navigating away from a tuning screen (or after a longer idle
+    // period), just not on every single toggle.
     private func startListening() throws {
         guard !isListening else { return }
         try ensureEngineRunning(needsRecording: true)
@@ -367,11 +386,8 @@ public class Tune2MeAudioEngineModule: Module {
         try? engine.start()
     }
 
-    // Without this, the engine and session stay active indefinitely after
-    // the first playTone()/startListening() call — confirmed on-device:
-    // VoiceOver stayed ducked for the rest of the app's life, and "Stop
-    // Tone" did nothing, because stopping tone playback alone never
-    // deactivated the session that was actually causing the ducking.
+    // Final cleanup only (OnDestroy) — see startListening()'s comment for
+    // why this is no longer called on every ordinary stop.
     private func teardownEngineIfIdle() {
         guard !isListening, !toneGenerator.isActive, engine.isRunning else { return }
         engine.stop()
