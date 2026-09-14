@@ -99,11 +99,27 @@ export default function AudioEngineDebugScreen() {
         </Text>
       )}
 
+      {/* An adjustable-role swipe control, not a plain button. Rusty's own
+          diagnosis: a double-tap-to-activate button is easy to miss under
+          VoiceOver (an imprecise tap can silently not register), and this
+          debug screen surfaced exactly that unreliability. VoiceOver's
+          swipe-up/down-while-focused gesture (fired as onAccessibilityAction
+          'increment'/'decrement') doesn't have that ambiguity, and it's the
+          same mechanism the real Mode-switch toggle is planned to use — see
+          AGENTS.md. Still tappable for sighted use, so it's never
+          swipe-only. */}
       <Pressable
         onPress={handleToggleListening}
+        onAccessibilityAction={(event) => {
+          if (event.nativeEvent.actionName === 'increment' || event.nativeEvent.actionName === 'decrement') {
+            handleToggleListening();
+          }
+        }}
         style={styles.button}
-        accessibilityRole="button"
-        accessibilityLabel={isListening ? 'Stop listening' : 'Start listening'}
+        accessibilityRole="adjustable"
+        accessibilityLabel="Listening"
+        accessibilityValue={{ text: isListening ? 'On' : 'Off' }}
+        accessibilityHint="Swipe up or down to toggle, or double tap"
         hitSlop={{ top: 14, bottom: 14, left: 14, right: 14 }}
       >
         <Text style={styles.buttonText}>{isListening ? 'Stop Listening' : 'Start Listening'}</Text>

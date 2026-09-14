@@ -13,22 +13,24 @@ import AVFoundation
 //   1. Built-in mic override survives a Bluetooth/wired headphone connect.
 //      CONFIRMED WORKING on-device 2026-09-14 (survived a wired headphone
 //      connect without falling back to the headphone mic).
-//   2. No VoiceOver volume ducking while listening. On-device testing
-//      2026-09-14 found this is NOT ordinary ducking (one thing quiets
-//      while another plays) — it's a uniform drop in ALL output, our own
-//      tone and VoiceOver's speech both, and it persisted indefinitely.
-//      Three compounding causes, all addressed: missing ".mixWithOthers";
-//      the engine/session never being torn down (teardownEngineIfIdle());
-//      and, confirmed via research to match a real, independently-
-//      documented iOS platform behavior (github.com/godotengine/godot/
-//      issues/88893, developer.apple.com/forums/thread/820613),
-//      .playAndRecord itself routes audio through a reduced "phone call"
-//      style volume ceiling that no session option removes — the only fix
-//      is not using .playAndRecord when recording isn't actually needed
-//      (see needsRecording throughout this file). Needs re-testing.
+//   2. No VoiceOver volume ducking while listening. Multiple rounds of
+//      on-device testing 2026-09-14 found: this is NOT ordinary ducking
+//      (one thing quiets while another plays), it's a uniform drop in ALL
+//      output; it happens on Start Listening ALONE, no tone needed, which
+//      is why .measurement mode itself (not just .playAndRecord) is the
+//      real culprit — see configureSession()'s comment; and real phone
+//      calls stay loud on speakerphone (Rusty's own sharp catch), which is
+//      what pointed at .voiceChat's Voice Processing I/O rather than a
+//      session-option fix. Currently testing TWO parallel approaches:
+//      .default mode for plain listening (Mode 2, no tone playing), and
+//      Voice Processing I/O + .voiceChat mode for "drone" mode (Mode 3,
+//      tone playing WHILE listening — see startDroneListening()). Neither
+//      confirmed working yet.
 //   3. Pitch accuracy against a known-good reference. Not yet reachable —
-//      blocked on the startListening() crash (also fixed 2026-09-14, see
-//      installTap's format: nil comment below); needs re-testing.
+//      blocked on TWO crashes now fixed: the original installTap format
+//      crash, and a second crash on a repeated Start Listening caused by
+//      reusing a stale cached output format across a stop/restart cycle
+//      (see reconnectSourceNodeToCurrentFormat()). Needs re-testing.
 //   4. Tone character + exact target frequency, by ear. CONFIRMED WORKING
 //      on-device 2026-09-14 (a tone played, audibly at the right pitch).
 // None of these are verifiable from CI — CI can only prove this compiles.
@@ -104,16 +106,16 @@ public class Tune2MeAudioEngineModule: Module {
         }
 
         // Mode 3's "drone" experiment: play a reference tone continuously
-        // WHILE listening, rather than play-then-listen sequentially. This
-        // needs .voiceChat mode (not .measurement) plus Apple's Voice
-        // Processing I/O (the same mechanism a real phone call uses to
-        // stay loud while two-way) — .measurement mode is deliberately
-        // quiet for output by Apple's own design (see configureSession's
-        // comment), which is fine for Mode 2's listen-only case but not
-        // for playing a tone the user needs to actually hear. Genuinely
-        // unproven territory - needs real on-device testing for both
-        // volume AND whether echo cancellation distorts pitch detection
-        // of the user's actual note.
+        // WHILE listening, rather than play-then-listen sequentially.
+        // Mode 2's plain .default mode (see configureSession) doesn't
+        // force echo cancellation, which is fine when nothing is playing
+        // — but here we DO need to play something loud while listening,
+        // and without echo cancellation that risks feedback between our
+        // own output and the mic. .voiceChat mode + Voice Processing I/O
+        // is the real mechanism a phone call uses to solve exactly that.
+        // Genuinely unproven territory - needs real on-device testing for
+        // both volume AND whether echo cancellation distorts pitch
+        // detection of the user's actual note.
         AsyncFunction("startDroneListening") { (frequencyHz: Double) throws -> Void in
             try self.startDroneListening(frequencyHz: frequencyHz)
         }
@@ -139,25 +141,25 @@ public class Tune2MeAudioEngineModule: Module {
     private func configureSession(needsRecording: Bool) throws {
         let session = AVAudioSession.sharedInstance()
         if needsRecording {
-            // .measurement mode avoids the DSP-driven part of the
-            // VoiceOver-ducking problem (echo cancellation / AGC distorting
-            // both pitch analysis and other audio), and .mixWithOthers
-            // avoids the "active session claims priority" ducking. But
-            // .playAndRecord itself carries a real, confirmed-on-device and
-            // independently-documented iOS platform limitation on top of
-            // both of those: it routes ALL audio - our own tone, AND
-            // VoiceOver's speech, everything - through a reduced "phone
-            // call" style volume ceiling, not just a relative duck of one
-            // thing against another (confirmed 2026-09-14; matches
-            // github.com/godotengine/godot/issues/88893 and
-            // developer.apple.com/forums/thread/820613, both reporting the
-            // same category-level volume ceiling). There's no session
-            // option that undoes this - the only fix is to not use
-            // .playAndRecord at all when recording isn't actually needed
-            // (see needsRecording above).
+            // .measurement mode was the original choice here (avoids the
+            // DSP-driven part of the VoiceOver-ducking problem — echo
+            // cancellation/AGC distorting both pitch analysis and other
+            // audio) but confirmed on-device 2026-09-14 that it STILL
+            // ducks VoiceOver even with nothing playing, just from
+            // listening alone: .measurement mode routes output through a
+            // reduced "phone call" style volume ceiling as a deliberate
+            // Apple design (it assumes a calibration/measurement app
+            // doesn't want its own output loud), and that ceiling applies
+            // to ALL system audio output while the session is active, not
+            // just ours — VoiceOver's speech included. .default mode
+            // doesn't carry that same deliberate quiet-output behavior,
+            // and (unlike .voiceChat) doesn't force AGC/echo-cancellation
+            // on by itself either — trying it here as the mode that
+            // hopefully keeps clean input AND normal volume. Needs
+            // re-testing to confirm both halves of that.
             try session.setCategory(
                 .playAndRecord,
-                mode: .measurement,
+                mode: .default,
                 options: [.mixWithOthers, .allowBluetoothA2DP, .defaultToSpeaker]
             )
         } else {
@@ -211,19 +213,28 @@ public class Tune2MeAudioEngineModule: Module {
         if engine.isRunning { engine.stop() }
         try configureSession(needsRecording: needsRecording)
         attachSourceNodeIfNeeded()
+        reconnectSourceNodeToCurrentFormat()
         engine.prepare()
         try engine.start()
         recordingCapable = needsRecording
     }
 
+    // Read on the real-time render thread, written from the main thread —
+    // in practice safe here because every write happens in
+    // reconnectSourceNodeToCurrentFormat(), which always runs BEFORE the
+    // engine (re)starts, so the render callback is never actually running
+    // concurrently with a write. Not a textbook-guaranteed-atomic setup,
+    // but a reasonable simplification for this prototype (same tradeoff
+    // already made for ToneGenerator's NSLock — see its own comment).
+    private var currentOutputSampleRate: Double = 44100
+
     private func attachSourceNodeIfNeeded() {
         guard sourceNode == nil else { return }
-        let format = engine.outputNode.inputFormat(forBus: 0)
-        let sampleRate = format.sampleRate
         let generator = toneGenerator
 
-        let node = AVAudioSourceNode { _, _, frameCount, audioBufferList -> OSStatus in
-            let samples = generator.render(frameCount: Int(frameCount), sampleRate: sampleRate)
+        let node = AVAudioSourceNode { [weak self] _, _, frameCount, audioBufferList -> OSStatus in
+            guard let self = self else { return noErr }
+            let samples = generator.render(frameCount: Int(frameCount), sampleRate: self.currentOutputSampleRate)
             let bufferList = UnsafeMutableAudioBufferListPointer(audioBufferList)
             for buffer in bufferList {
                 let outPointer = UnsafeMutableBufferPointer<Float>(buffer)
@@ -235,8 +246,24 @@ public class Tune2MeAudioEngineModule: Module {
         }
 
         engine.attach(node)
-        engine.connect(node, to: engine.mainMixerNode, format: format)
         sourceNode = node
+    }
+
+    // Reconnects the source node using the engine's CURRENT output format,
+    // rather than trusting a format cached from whenever the node was
+    // first attached. The hardware/session format can genuinely change
+    // across a stop/restart cycle (e.g. after a category switch between
+    // .playback and .playAndRecord) — reusing a stale format is exactly
+    // the kind of mismatch that crashes AVAudioEngine with a native
+    // exception Swift's try/catch can't catch. Confirmed on-device
+    // 2026-09-14: the app crashed on a second Start Listening after a
+    // successful stop, matching this failure mode. Must be called AFTER
+    // attachSourceNodeIfNeeded() and BEFORE engine.start(), every time.
+    private func reconnectSourceNodeToCurrentFormat() {
+        guard let node = sourceNode else { return }
+        let format = engine.outputNode.inputFormat(forBus: 0)
+        currentOutputSampleRate = format.sampleRate
+        engine.connect(node, to: engine.mainMixerNode, format: format)
     }
 
     private func startListening() throws {
@@ -290,6 +317,7 @@ public class Tune2MeAudioEngineModule: Module {
         attachSourceNodeIfNeeded()
         try engine.inputNode.setVoiceProcessingEnabled(true)
         try engine.outputNode.setVoiceProcessingEnabled(true)
+        reconnectSourceNodeToCurrentFormat()
 
         engine.prepare()
         try engine.start()
