@@ -13,12 +13,19 @@ import AVFoundation
 //   1. Built-in mic override survives a Bluetooth/wired headphone connect.
 //      CONFIRMED WORKING on-device 2026-09-14 (survived a wired headphone
 //      connect without falling back to the headphone mic).
-//   2. No VoiceOver volume ducking while listening. ".measurement" mode
-//      alone was NOT enough — confirmed on-device 2026-09-14 that VoiceOver
-//      still ducked dramatically and stayed ducked indefinitely. Root
-//      cause was missing ".mixWithOthers" plus the engine/session never
-//      being torn down; see configureSession()/teardownEngineIfIdle().
-//      Needs re-testing after that fix.
+//   2. No VoiceOver volume ducking while listening. On-device testing
+//      2026-09-14 found this is NOT ordinary ducking (one thing quiets
+//      while another plays) — it's a uniform drop in ALL output, our own
+//      tone and VoiceOver's speech both, and it persisted indefinitely.
+//      Three compounding causes, all addressed: missing ".mixWithOthers";
+//      the engine/session never being torn down (teardownEngineIfIdle());
+//      and, confirmed via research to match a real, independently-
+//      documented iOS platform behavior (github.com/godotengine/godot/
+//      issues/88893, developer.apple.com/forums/thread/820613),
+//      .playAndRecord itself routes audio through a reduced "phone call"
+//      style volume ceiling that no session option removes — the only fix
+//      is not using .playAndRecord when recording isn't actually needed
+//      (see needsRecording throughout this file). Needs re-testing.
 //   3. Pitch accuracy against a known-good reference. Not yet reachable —
 //      blocked on the startListening() crash (also fixed 2026-09-14, see
 //      installTap's format: nil comment below); needs re-testing.
@@ -60,7 +67,11 @@ public class Tune2MeAudioEngineModule: Module {
         }
 
         AsyncFunction("playTone") { (frequencyHz: Double, durationSeconds: Double) throws -> Void in
-            try self.ensureEngineRunning()
+            // Only request recording capability if we're already listening
+            // (Mode 3's simultaneous play+listen). A standalone tone (Mode
+            // 1, mic never touched) uses .playback instead of
+            // .playAndRecord - see ensureEngineRunning()/configureSession().
+            try self.ensureEngineRunning(needsRecording: self.isListening)
             self.toneGenerator.play(frequencyHz: frequencyHz, durationSeconds: durationSeconds)
         }
 
@@ -83,23 +94,40 @@ public class Tune2MeAudioEngineModule: Module {
 
     // MARK: - Session configuration
 
-    private func configureSession() throws {
+    private func configureSession(needsRecording: Bool) throws {
         let session = AVAudioSession.sharedInstance()
-        // .measurement mode (not .voiceChat/.default) avoids the DSP-driven
-        // part of the VoiceOver-ducking problem (echo cancellation / AGC
-        // distorting both pitch analysis and other audio). But mode alone
-        // wasn't enough — confirmed on-device: without .mixWithOthers, an
-        // active .playAndRecord session tells iOS this app needs audio
-        // priority, and VoiceOver's own speech gets ducked as "other
-        // audio" exactly like the "Talking Tuner" bug this app exists to
-        // avoid. .mixWithOthers is what actually stops that.
-        try session.setCategory(
-            .playAndRecord,
-            mode: .measurement,
-            options: [.mixWithOthers, .allowBluetoothA2DP, .defaultToSpeaker]
-        )
+        if needsRecording {
+            // .measurement mode avoids the DSP-driven part of the
+            // VoiceOver-ducking problem (echo cancellation / AGC distorting
+            // both pitch analysis and other audio), and .mixWithOthers
+            // avoids the "active session claims priority" ducking. But
+            // .playAndRecord itself carries a real, confirmed-on-device and
+            // independently-documented iOS platform limitation on top of
+            // both of those: it routes ALL audio - our own tone, AND
+            // VoiceOver's speech, everything - through a reduced "phone
+            // call" style volume ceiling, not just a relative duck of one
+            // thing against another (confirmed 2026-09-14; matches
+            // github.com/godotengine/godot/issues/88893 and
+            // developer.apple.com/forums/thread/820613, both reporting the
+            // same category-level volume ceiling). There's no session
+            // option that undoes this - the only fix is to not use
+            // .playAndRecord at all when recording isn't actually needed
+            // (see needsRecording above).
+            try session.setCategory(
+                .playAndRecord,
+                mode: .measurement,
+                options: [.mixWithOthers, .allowBluetoothA2DP, .defaultToSpeaker]
+            )
+        } else {
+            // Mode 1 (reference tone, mic never touched) doesn't need
+            // .playAndRecord at all - .playback stays at full media volume
+            // with no reduced-ceiling behavior.
+            try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
+        }
         try session.setActive(true)
-        try preferBuiltInMic(session: session)
+        if needsRecording {
+            try preferBuiltInMic(session: session)
+        }
     }
 
     private func preferBuiltInMic(session: AVAudioSession) throws {
@@ -128,12 +156,22 @@ public class Tune2MeAudioEngineModule: Module {
 
     // MARK: - Engine lifecycle
 
-    private func ensureEngineRunning() throws {
-        if engine.isRunning { return }
-        try configureSession()
+    // Tracks which category the session is currently configured for, so a
+    // later call that needs recording (e.g. Mode 3 starting to listen
+    // while a Mode-1-style tone session is already running) can upgrade
+    // from .playback to .playAndRecord - and so a call that only needs
+    // playback doesn't unnecessarily pay .playAndRecord's volume-ceiling
+    // cost when nothing is actually recording.
+    private var recordingCapable = false
+
+    private func ensureEngineRunning(needsRecording: Bool) throws {
+        if engine.isRunning && (recordingCapable || !needsRecording) { return }
+        if engine.isRunning { engine.stop() }
+        try configureSession(needsRecording: needsRecording)
         attachSourceNodeIfNeeded()
         engine.prepare()
         try engine.start()
+        recordingCapable = needsRecording
     }
 
     private func attachSourceNodeIfNeeded() {
@@ -161,7 +199,7 @@ public class Tune2MeAudioEngineModule: Module {
 
     private func startListening() throws {
         guard !isListening else { return }
-        try ensureEngineRunning()
+        try ensureEngineRunning(needsRecording: true)
 
         // format: nil (not a pre-computed format) is deliberate — it lets
         // AVAudioEngine use the input bus's own current format. Passing an
@@ -191,6 +229,7 @@ public class Tune2MeAudioEngineModule: Module {
     private func teardownEngineIfIdle() {
         guard !isListening, !toneGenerator.isActive, engine.isRunning else { return }
         engine.stop()
+        recordingCapable = false
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
     }
 
